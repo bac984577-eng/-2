@@ -162,7 +162,10 @@ jobs:
           import android.content.SharedPreferences
           import android.content.pm.ServiceInfo
           import android.content.res.Configuration
+          import android.graphics.Canvas
           import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
           import android.graphics.PixelFormat
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
@@ -188,6 +191,7 @@ jobs:
           import androidx.media3.common.AudioAttributes
           import androidx.media3.common.C
           import androidx.media3.common.MediaItem
+          import androidx.media3.common.Player
           import androidx.media3.exoplayer.ExoPlayer
           import androidx.media3.exoplayer.SeekParameters
           import kotlin.math.abs
@@ -222,6 +226,7 @@ jobs:
               private var windowManager: WindowManager? = null
               private var ball: View? = null
               private var ballParams: WindowManager.LayoutParams? = null
+              private var centerIcon: PlayPauseIcon? = null
 
               private val saver = object : Runnable {
                   override fun run() {
@@ -246,6 +251,11 @@ jobs:
                       .setWakeMode(C.WAKE_MODE_LOCAL)
                       .build()
                   player.setSeekParameters(SeekParameters.EXACT)
+                  player.addListener(object : Player.Listener {
+                      override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                          centerIcon?.setPlaying(playWhenReady)
+                      }
+                  })
                   createChannel()
                   handler.postDelayed(saver, 4000)
               }
@@ -309,6 +319,17 @@ jobs:
                   player.seekTo(t)
               }
 
+              /** Pause when playing, resume when paused. */
+              fun togglePlay() {
+                  if (!hasMedia) return
+                  if (player.playbackState == Player.STATE_ENDED) {
+                      player.seekTo(0L)
+                      player.playWhenReady = true
+                  } else {
+                      player.playWhenReady = !player.playWhenReady
+                  }
+              }
+
               fun isBallShown(): Boolean = ball != null
 
               fun setBallVisible(visible: Boolean) {
@@ -365,6 +386,7 @@ jobs:
                   }
                   ball = null
                   ballParams = null
+                  centerIcon = null
               }
 
               private fun buildBall(size: Int, d: Float): View {
@@ -372,17 +394,24 @@ jobs:
                   root.layoutDirection = View.LAYOUT_DIRECTION_LTR
                   val bg = GradientDrawable()
                   bg.shape = GradientDrawable.OVAL
-                  bg.setColor(Color.parseColor("#E60E6A60"))
-                  bg.setStroke((2 * d).toInt(), Color.parseColor("#66FFFFFF"))
+                  bg.setColor(Color.parseColor("#F01B5E86"))
+                  bg.setStroke((2 * d).toInt(), Color.parseColor("#CC1FB8CE"))
                   root.background = bg
 
-                  root.addView(half("«"), FrameLayout.LayoutParams(size / 2, size, Gravity.LEFT))
-                  root.addView(half("»"), FrameLayout.LayoutParams(size / 2, size, Gravity.RIGHT))
+                  val side = (size * 0.3f).toInt()
+                  root.addView(half("«"), FrameLayout.LayoutParams(side, size, Gravity.LEFT))
+                  root.addView(half("»"), FrameLayout.LayoutParams(side, size, Gravity.RIGHT))
 
-                  val line = View(this)
-                  line.setBackgroundColor(Color.parseColor("#55FFFFFF"))
-                  val lineWidth = max(1, d.toInt())
-                  root.addView(line, FrameLayout.LayoutParams(lineWidth, (size * 0.4f).toInt(), Gravity.CENTER))
+                  val c = (size * 0.4f).toInt()
+                  val icon = PlayPauseIcon(this)
+                  val circle = GradientDrawable()
+                  circle.shape = GradientDrawable.OVAL
+                  circle.setColor(Color.parseColor("#E0463C"))
+                  circle.setStroke((2 * d).toInt(), Color.parseColor("#F4F7F8"))
+                  icon.background = circle
+                  icon.setPlaying(player.playWhenReady)
+                  root.addView(icon, FrameLayout.LayoutParams(c, c, Gravity.CENTER))
+                  centerIcon = icon
                   return root
               }
 
@@ -443,8 +472,14 @@ jobs:
                               if (moved) {
                                   prefs.edit().putInt("bx", lp.x).putInt("by", lp.y).apply()
                               } else {
-                                  val backSide = e.x < v.width / 2f
-                                  skip(if (backSide) -SKIP_MS else SKIP_MS)
+                                  val frac = e.x / v.width
+                                  if (frac < 0.3f) {
+                                      skip(-SKIP_MS)
+                                  } else if (frac > 0.7f) {
+                                      skip(SKIP_MS)
+                                  } else {
+                                      togglePlay()
+                                  }
                                   v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                                   v.animate().scaleX(0.9f).scaleY(0.9f).setDuration(70).withEndAction {
                                       v.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
@@ -539,7 +574,49 @@ jobs:
                   const val SKIP_MS = 15_000L
                   private const val CHANNEL = "playback"
                   private const val NOTIF_ID = 1
-                  private const val SIZE_DP = 88
+                  private const val SIZE_DP = 96
+              }
+          }
+
+          /** Center button of the ball: two bars while playing, a triangle while paused. */
+          class PlayPauseIcon(context: Context) : View(context) {
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private var playing = true
+
+              init {
+                  paint.color = Color.WHITE
+              }
+
+              fun setPlaying(p: Boolean) {
+                  if (playing != p) {
+                      playing = p
+                      invalidate()
+                  }
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  if (playing) {
+                      val bw = w * 0.14f
+                      val bh = h * 0.42f
+                      val top = (h - bh) / 2f
+                      val gap = w * 0.12f
+                      val left1 = w / 2f - gap / 2f - bw
+                      val left2 = w / 2f + gap / 2f
+                      canvas.drawRoundRect(left1, top, left1 + bw, top + bh, bw / 3f, bw / 3f, paint)
+                      canvas.drawRoundRect(left2, top, left2 + bw, top + bh, bw / 3f, bw / 3f, paint)
+                  } else {
+                      val s = h * 0.44f
+                      val x0 = w / 2f - s * 0.3f
+                      val path = Path()
+                      path.moveTo(x0, h / 2f - s / 2f)
+                      path.lineTo(x0, h / 2f + s / 2f)
+                      path.lineTo(x0 + s * 0.85f, h / 2f)
+                      path.close()
+                      canvas.drawPath(path, paint)
+                  }
               }
           }
           LP_EOF
@@ -882,13 +959,13 @@ jobs:
 
               companion object {
                   private const val REQ_PICK = 11
-                  private val BG = Color.parseColor("#0F1514")
-                  private val SURFACE = Color.parseColor("#172120")
-                  private val FG = Color.parseColor("#E6EEEA")
-                  private val MUTED = Color.parseColor("#8FA19A")
-                  private val LINE = Color.parseColor("#2A3836")
-                  private val ACCENT = Color.parseColor("#4FC4B3")
-                  private val ACCENT_INK = Color.parseColor("#072420")
+                  private val BG = Color.parseColor("#0B2536")
+                  private val SURFACE = Color.parseColor("#12384F")
+                  private val FG = Color.parseColor("#F4F7F8")
+                  private val MUTED = Color.parseColor("#9DB6C4")
+                  private val LINE = Color.parseColor("#245D7C")
+                  private val ACCENT = Color.parseColor("#1FB8CE")
+                  private val ACCENT_INK = Color.parseColor("#04222E")
               }
           }
           LP_EOF
