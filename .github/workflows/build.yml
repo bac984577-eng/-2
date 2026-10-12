@@ -1,0 +1,912 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate project files
+        run: |
+          cat > 'settings.gradle.kts' <<'LP_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "LecturePlayer"
+          include(":app")
+          LP_EOF
+          cat > 'build.gradle.kts' <<'LP_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          LP_EOF
+          cat > 'gradle.properties' <<'LP_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          LP_EOF
+          mkdir -p 'app'
+          cat > 'app/build.gradle.kts' <<'LP_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "app.lectureplayer"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "app.lectureplayer"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.media3:media3-exoplayer:1.3.1")
+          }
+          LP_EOF
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'LP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_app"
+                  android:label="مشغل المحاضرة"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".PlayerService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
+              </application>
+          </manifest>
+          LP_EOF
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/ic_app.xml' <<'LP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="96dp"
+              android:height="96dp"
+              android:viewportWidth="96"
+              android:viewportHeight="96">
+              <path
+                  android:fillColor="#0E6A60"
+                  android:pathData="M48,48m-44,0a44,44 0 1,1 88,0a44,44 0 1,1 -88,0" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M24,48l18,-14l0,28z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M72,48l-18,-14l0,28z" />
+          </vector>
+          LP_EOF
+          mkdir -p 'app/src/main/java/app/lectureplayer'
+          cat > 'app/src/main/java/app/lectureplayer/PlayerService.kt' <<'LP_EOF'
+          package app.lectureplayer
+
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.ServiceInfo
+          import android.content.res.Configuration
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.Icon
+          import android.net.Uri
+          import android.os.Binder
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Settings
+          import android.text.SpannableString
+          import android.text.Spanned
+          import android.text.style.RelativeSizeSpan
+          import android.view.Gravity
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import android.view.WindowManager
+          import android.widget.FrameLayout
+          import android.widget.TextView
+          import androidx.media3.common.AudioAttributes
+          import androidx.media3.common.C
+          import androidx.media3.common.MediaItem
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.exoplayer.SeekParameters
+          import kotlin.math.abs
+          import kotlin.math.max
+
+          /**
+           * Owns the single ExoPlayer and the floating ball.
+           * Runs as a foreground media-playback service so playback stays smooth
+           * while the user types in another app.
+           */
+          class PlayerService : Service() {
+
+              inner class LocalBinder : Binder() {
+                  val service: PlayerService get() = this@PlayerService
+              }
+
+              private val binder = LocalBinder()
+              private val handler = Handler(Looper.getMainLooper())
+              private lateinit var prefs: SharedPreferences
+
+              lateinit var player: ExoPlayer
+                  private set
+
+              var hasMedia = false
+                  private set
+              var title = ""
+                  private set
+
+              private var currentUri: String? = null
+              private var ballHidden = false
+
+              private var windowManager: WindowManager? = null
+              private var ball: View? = null
+              private var ballParams: WindowManager.LayoutParams? = null
+
+              private val saver = object : Runnable {
+                  override fun run() {
+                      savePosition()
+                      handler.postDelayed(this, 4000)
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  prefs = getSharedPreferences("lp", Context.MODE_PRIVATE)
+                  ballHidden = prefs.getBoolean("ball_hidden", false)
+                  player = ExoPlayer.Builder(this)
+                      .setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(C.USAGE_MEDIA)
+                              .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
+                              .build(),
+                          true
+                      )
+                      .setHandleAudioBecomingNoisy(true)
+                      .setWakeMode(C.WAKE_MODE_LOCAL)
+                      .build()
+                  player.setSeekParameters(SeekParameters.EXACT)
+                  createChannel()
+                  handler.postDelayed(saver, 4000)
+              }
+
+              override fun onBind(intent: Intent?): IBinder = binder
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      fullStop()
+                      return START_NOT_STICKY
+                  }
+                  enterForeground()
+                  val uri = intent?.getStringExtra(EXTRA_URI)
+                  if (uri != null) {
+                      load(uri, intent?.getStringExtra(EXTRA_NAME) ?: "")
+                  }
+                  showBall()
+                  return START_NOT_STICKY
+              }
+
+              private fun load(uri: String, name: String) {
+                  title = name
+                  if (uri != currentUri) {
+                      savePosition()
+                      currentUri = uri
+                      player.setMediaItem(MediaItem.fromUri(Uri.parse(uri)))
+                      player.prepare()
+                      val saved = prefs.getLong("p_" + uri.hashCode(), 0L)
+                      if (saved > 0L) player.seekTo(saved)
+                  }
+                  hasMedia = true
+                  player.playWhenReady = true
+                  notificationManager().notify(NOTIF_ID, buildNotification())
+              }
+
+              private fun savePosition() {
+                  val u = currentUri ?: return
+                  if (!hasMedia) return
+                  val p = player.currentPosition
+                  if (p >= 0L) prefs.edit().putLong("p_" + u.hashCode(), p).apply()
+              }
+
+              private fun fullStop() {
+                  savePosition()
+                  player.stop()
+                  player.clearMediaItems()
+                  hasMedia = false
+                  currentUri = null
+                  hideBall()
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              /** Back or forward by the given number of milliseconds. */
+              fun skip(deltaMs: Long) {
+                  if (!hasMedia) return
+                  var t = player.currentPosition + deltaMs
+                  val dur = player.duration
+                  if (t < 0L) t = 0L
+                  if (dur != C.TIME_UNSET && t > dur) t = dur
+                  player.seekTo(t)
+              }
+
+              fun isBallShown(): Boolean = ball != null
+
+              fun setBallVisible(visible: Boolean) {
+                  ballHidden = !visible
+                  prefs.edit().putBoolean("ball_hidden", ballHidden).apply()
+                  if (visible) showBall() else hideBall()
+              }
+
+              // ---------------------------------------------------------------- ball
+
+              @Suppress("DEPRECATION")
+              fun showBall() {
+                  if (ball != null || !hasMedia || ballHidden) return
+                  if (!Settings.canDrawOverlays(this)) return
+                  val manager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  windowManager = manager
+                  val dm = resources.displayMetrics
+                  val d = dm.density
+                  val size = (SIZE_DP * d).toInt()
+                  val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  } else {
+                      WindowManager.LayoutParams.TYPE_PHONE
+                  }
+                  val lp = WindowManager.LayoutParams(
+                      size, size, type,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.LEFT
+                  lp.x = prefs.getInt("bx", (16 * d).toInt())
+                  lp.y = prefs.getInt("by", dm.heightPixels / 3)
+                  clamp(lp)
+                  val view = buildBall(size, d)
+                  attachTouch(view, lp)
+                  try {
+                      manager.addView(view, lp)
+                  } catch (e: Exception) {
+                      return
+                  }
+                  ball = view
+                  ballParams = lp
+              }
+
+              fun hideBall() {
+                  val v = ball
+                  if (v != null) {
+                      try {
+                          windowManager?.removeView(v)
+                      } catch (e: Exception) {
+                      }
+                  }
+                  ball = null
+                  ballParams = null
+              }
+
+              private fun buildBall(size: Int, d: Float): View {
+                  val root = FrameLayout(this)
+                  root.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  val bg = GradientDrawable()
+                  bg.shape = GradientDrawable.OVAL
+                  bg.setColor(Color.parseColor("#E60E6A60"))
+                  bg.setStroke((2 * d).toInt(), Color.parseColor("#66FFFFFF"))
+                  root.background = bg
+
+                  root.addView(half("«"), FrameLayout.LayoutParams(size / 2, size, Gravity.LEFT))
+                  root.addView(half("»"), FrameLayout.LayoutParams(size / 2, size, Gravity.RIGHT))
+
+                  val line = View(this)
+                  line.setBackgroundColor(Color.parseColor("#55FFFFFF"))
+                  val lineWidth = max(1, d.toInt())
+                  root.addView(line, FrameLayout.LayoutParams(lineWidth, (size * 0.4f).toInt(), Gravity.CENTER))
+                  return root
+              }
+
+              private fun half(symbol: String): TextView {
+                  val s = SpannableString(symbol + "\n15")
+                  s.setSpan(RelativeSizeSpan(1.7f), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                  val tv = TextView(this)
+                  tv.text = s
+                  tv.setTextColor(Color.WHITE)
+                  tv.gravity = Gravity.CENTER
+                  tv.typeface = Typeface.DEFAULT_BOLD
+                  tv.textSize = 15f
+                  tv.includeFontPadding = false
+                  return tv
+              }
+
+              private fun clamp(lp: WindowManager.LayoutParams) {
+                  val dm = resources.displayMetrics
+                  lp.x = lp.x.coerceIn(0, max(0, dm.widthPixels - lp.width))
+                  lp.y = lp.y.coerceIn(0, max(0, dm.heightPixels - lp.height))
+              }
+
+              @SuppressLint("ClickableViewAccessibility")
+              private fun attachTouch(view: View, lp: WindowManager.LayoutParams) {
+                  var downX = 0f
+                  var downY = 0f
+                  var startX = 0
+                  var startY = 0
+                  var moved = false
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop
+
+                  view.setOnTouchListener { v, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX
+                              downY = e.rawY
+                              startX = lp.x
+                              startY = lp.y
+                              moved = false
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - downX
+                              val dy = e.rawY - downY
+                              if (!moved && (abs(dx) > slop || abs(dy) > slop)) moved = true
+                              if (moved) {
+                                  lp.x = (startX + dx).toInt()
+                                  lp.y = (startY + dy).toInt()
+                                  clamp(lp)
+                                  try {
+                                      windowManager?.updateViewLayout(v, lp)
+                                  } catch (ex: Exception) {
+                                  }
+                              }
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (moved) {
+                                  prefs.edit().putInt("bx", lp.x).putInt("by", lp.y).apply()
+                              } else {
+                                  val backSide = e.x < v.width / 2f
+                                  skip(if (backSide) -SKIP_MS else SKIP_MS)
+                                  v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                                  v.animate().scaleX(0.9f).scaleY(0.9f).setDuration(70).withEndAction {
+                                      v.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
+                                  }.start()
+                              }
+                              true
+                          }
+                          MotionEvent.ACTION_CANCEL -> true
+                          else -> false
+                      }
+                  }
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  val v = ball
+                  val lp = ballParams
+                  if (v != null && lp != null) {
+                      clamp(lp)
+                      try {
+                          windowManager?.updateViewLayout(v, lp)
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------- notification
+
+              private fun notificationManager(): NotificationManager =
+                  getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+              private fun createChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val ch = NotificationChannel(CHANNEL, "تشغيل المحاضرة", NotificationManager.IMPORTANCE_LOW)
+                      notificationManager().createNotificationChannel(ch)
+                  }
+              }
+
+              private fun enterForeground() {
+                  val n = buildNotification()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                  } else {
+                      startForeground(NOTIF_ID, n)
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun buildNotification(): Notification {
+                  val open = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val stopIntent = Intent(this, PlayerService::class.java)
+                  stopIntent.action = ACTION_STOP
+                  val stop = PendingIntent.getService(
+                      this, 1, stopIntent,
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, CHANNEL)
+                  } else {
+                      Notification.Builder(this)
+                  }
+                  b.setSmallIcon(android.R.drawable.ic_media_play)
+                  b.setContentTitle(if (title.isEmpty()) "مشغل المحاضرة" else title)
+                  b.setContentText("اضغط لفتح المشغل")
+                  b.setContentIntent(open)
+                  b.setOngoing(true)
+                  b.addAction(
+                      Notification.Action.Builder(
+                          Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+                          "إيقاف وإغلاق",
+                          stop
+                      ).build()
+                  )
+                  return b.build()
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(saver)
+                  savePosition()
+                  hideBall()
+                  player.release()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val ACTION_STOP = "app.lectureplayer.STOP"
+                  const val EXTRA_URI = "uri"
+                  const val EXTRA_NAME = "name"
+                  const val SKIP_MS = 15_000L
+                  private const val CHANNEL = "playback"
+                  private const val NOTIF_ID = 1
+                  private const val SIZE_DP = 88
+              }
+          }
+          LP_EOF
+          mkdir -p 'app/src/main/java/app/lectureplayer'
+          cat > 'app/src/main/java/app/lectureplayer/MainActivity.kt' <<'LP_EOF'
+          package app.lectureplayer
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.ServiceConnection
+          import android.content.pm.PackageManager
+          import android.content.res.ColorStateList
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.OpenableColumns
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import androidx.media3.common.C
+          import androidx.media3.common.Player
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+
+              private var svc: PlayerService? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private var dragging = false
+
+              private lateinit var nameView: TextView
+              private lateinit var timeView: TextView
+              private lateinit var seekBar: SeekBar
+              private lateinit var playBtn: Button
+              private lateinit var controls: LinearLayout
+              private lateinit var overlayBox: LinearLayout
+              private lateinit var ballBtn: Button
+
+              private val conn = object : ServiceConnection {
+                  override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                      svc = (binder as PlayerService.LocalBinder).service
+                      svc?.showBall()
+                      refresh()
+                  }
+
+                  override fun onServiceDisconnected(name: ComponentName?) {
+                      svc = null
+                  }
+              }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      refresh()
+                      ui.postDelayed(this, 500)
+                  }
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(BG)
+                  root.setPadding(dp(22), dp(40), dp(22), dp(24))
+                  root.layoutDirection = View.LAYOUT_DIRECTION_RTL
+
+                  val title = TextView(this)
+                  title.text = "مشغل المحاضرة"
+                  title.setTextColor(FG)
+                  title.textSize = 26f
+                  title.typeface = Typeface.DEFAULT_BOLD
+                  root.addView(title, matchWrap(0))
+
+                  val sub = TextView(this)
+                  sub.text = "اختر تسجيلًا واحدًا، ثم اكتب في أي تطبيق وتحكّم بالتسجيل من الكرة العائمة: ١٥ ثانية للخلف أو للأمام."
+                  sub.setTextColor(MUTED)
+                  sub.textSize = 14f
+                  sub.setLineSpacing(0f, 1.25f)
+                  root.addView(sub, matchWrap(8))
+
+                  val pick = makeButton("اختيار التسجيل", true) { pickFile() }
+                  root.addView(pick, buttonParams(20))
+
+                  nameView = TextView(this)
+                  nameView.setTextColor(FG)
+                  nameView.textSize = 15f
+                  nameView.maxLines = 2
+                  root.addView(nameView, matchWrap(14))
+
+                  controls = LinearLayout(this)
+                  controls.orientation = LinearLayout.VERTICAL
+
+                  seekBar = SeekBar(this)
+                  seekBar.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  seekBar.progressTintList = ColorStateList.valueOf(ACCENT)
+                  seekBar.thumbTintList = ColorStateList.valueOf(ACCENT)
+                  seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                          if (fromUser) timeView.text = timeText(progress.toLong(), seekBar.max.toLong())
+                      }
+
+                      override fun onStartTrackingTouch(sb: SeekBar?) {
+                          dragging = true
+                      }
+
+                      override fun onStopTrackingTouch(sb: SeekBar?) {
+                          svc?.player?.seekTo(seekBar.progress.toLong())
+                          dragging = false
+                      }
+                  })
+                  controls.addView(seekBar, matchWrap(10))
+
+                  timeView = TextView(this)
+                  timeView.setTextColor(MUTED)
+                  timeView.textSize = 14f
+                  timeView.gravity = Gravity.CENTER
+                  timeView.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  controls.addView(timeView, matchWrap(0))
+
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  val back = makeButton("« 15", false) { svc?.skip(-PlayerService.SKIP_MS) }
+                  playBtn = makeButton("تشغيل", true) { togglePlay() }
+                  val fwd = makeButton("15 »", false) { svc?.skip(PlayerService.SKIP_MS) }
+                  row.addView(back, weighted(1f))
+                  row.addView(playBtn, weighted(1.4f))
+                  row.addView(fwd, weighted(1f))
+                  controls.addView(row, matchWrap(14))
+
+                  ballBtn = makeButton("إخفاء الكرة", false) {
+                      val s = svc
+                      if (s != null) {
+                          s.setBallVisible(!s.isBallShown())
+                          refresh()
+                      }
+                  }
+                  controls.addView(ballBtn, buttonParams(14))
+
+                  val stopBtn = makeButton("إيقاف وإغلاق", false) {
+                      val i = Intent(this, PlayerService::class.java)
+                      i.action = PlayerService.ACTION_STOP
+                      startService(i)
+                  }
+                  controls.addView(stopBtn, buttonParams(10))
+                  root.addView(controls, matchWrap(8))
+
+                  overlayBox = LinearLayout(this)
+                  overlayBox.orientation = LinearLayout.VERTICAL
+                  val why = TextView(this)
+                  why.text = "لتظهر الكرة فوق التطبيقات الأخرى، فعّل «العرض فوق التطبيقات الأخرى» لهذا التطبيق."
+                  why.setTextColor(MUTED)
+                  why.textSize = 14f
+                  why.setLineSpacing(0f, 1.25f)
+                  overlayBox.addView(why, matchWrap(0))
+                  val allow = makeButton("السماح بالظهور فوق التطبيقات", true) {
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName))
+                      )
+                  }
+                  overlayBox.addView(allow, buttonParams(10))
+                  root.addView(overlayBox, matchWrap(22))
+
+                  setContentView(root)
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7)
+                  }
+                  refresh()
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  bindService(Intent(this, PlayerService::class.java), conn, Context.BIND_AUTO_CREATE)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  svc?.showBall()
+                  ui.post(tick)
+              }
+
+              override fun onPause() {
+                  ui.removeCallbacks(tick)
+                  super.onPause()
+              }
+
+              override fun onStop() {
+                  try {
+                      unbindService(conn)
+                  } catch (e: Exception) {
+                  }
+                  svc = null
+                  super.onStop()
+              }
+
+              // ------------------------------------------------------------- actions
+
+              private fun pickFile() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "*/*"
+                  i.putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("audio/*", "video/*"))
+                  startActivityForResult(i, REQ_PICK)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != REQ_PICK || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  try {
+                      contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  } catch (e: Exception) {
+                  }
+                  val i = Intent(this, PlayerService::class.java)
+                  i.putExtra(PlayerService.EXTRA_URI, uri.toString())
+                  i.putExtra(PlayerService.EXTRA_NAME, queryName(uri))
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+              }
+
+              private fun queryName(uri: Uri): String {
+                  try {
+                      contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                          if (c.moveToFirst()) return c.getString(0) ?: ""
+                      }
+                  } catch (e: Exception) {
+                  }
+                  return uri.lastPathSegment ?: "تسجيل"
+              }
+
+              private fun togglePlay() {
+                  val p = svc?.player ?: return
+                  if (p.playbackState == Player.STATE_ENDED) {
+                      p.seekTo(0)
+                      p.playWhenReady = true
+                  } else {
+                      p.playWhenReady = !p.playWhenReady
+                  }
+              }
+
+              private fun refresh() {
+                  val s = svc
+                  val has = s != null && s.hasMedia
+                  controls.visibility = if (has) View.VISIBLE else View.GONE
+                  nameView.text = if (has && s != null) s.title else "لم تختر تسجيلًا بعد"
+
+                  val canDraw = Settings.canDrawOverlays(this)
+                  overlayBox.visibility = if (canDraw) View.GONE else View.VISIBLE
+                  ballBtn.visibility = if (canDraw) View.VISIBLE else View.GONE
+
+                  if (has && s != null) {
+                      ballBtn.text = if (s.isBallShown()) "إخفاء الكرة" else "إظهار الكرة"
+                      val p = s.player
+                      val dur = p.duration
+                      val durOk = if (dur == C.TIME_UNSET || dur < 0L) 0L else dur
+                      seekBar.max = durOk.toInt()
+                      if (!dragging) {
+                          val pos = p.currentPosition.coerceIn(0L, durOk)
+                          seekBar.progress = pos.toInt()
+                          timeView.text = timeText(pos, durOk)
+                      }
+                      val playing = p.playWhenReady && p.playbackState != Player.STATE_ENDED
+                      playBtn.text = if (playing) "إيقاف مؤقت" else "تشغيل"
+                  }
+              }
+
+              // ------------------------------------------------------------- helpers
+
+              private fun timeText(pos: Long, dur: Long): String = fmt(pos) + " / " + fmt(dur)
+
+              private fun fmt(ms: Long): String {
+                  val total = (if (ms < 0L) 0L else ms) / 1000L
+                  val h = total / 3600L
+                  val m = (total % 3600L) / 60L
+                  val r = total % 60L
+                  return if (h > 0L) {
+                      String.format(Locale.US, "%d:%02d:%02d", h, m, r)
+                  } else {
+                      String.format(Locale.US, "%d:%02d", m, r)
+                  }
+              }
+
+              private fun matchWrap(topDp: Int): LinearLayout.LayoutParams {
+                  val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  lp.topMargin = dp(topDp)
+                  return lp
+              }
+
+              private fun buttonParams(topDp: Int): LinearLayout.LayoutParams {
+                  val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54))
+                  lp.topMargin = dp(topDp)
+                  return lp
+              }
+
+              private fun weighted(w: Float): LinearLayout.LayoutParams {
+                  val lp = LinearLayout.LayoutParams(0, dp(58), w)
+                  lp.leftMargin = dp(5)
+                  lp.rightMargin = dp(5)
+                  return lp
+              }
+
+              private fun makeButton(label: String, filled: Boolean, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.isAllCaps = false
+                  b.textSize = 16f
+                  b.typeface = Typeface.DEFAULT_BOLD
+                  b.setTextColor(if (filled) ACCENT_INK else FG)
+                  val bg = GradientDrawable()
+                  bg.cornerRadius = 14f * resources.displayMetrics.density
+                  if (filled) {
+                      bg.setColor(ACCENT)
+                  } else {
+                      bg.setColor(SURFACE)
+                      bg.setStroke(dp(1), LINE)
+                  }
+                  b.background = bg
+                  b.stateListAnimator = null
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              companion object {
+                  private const val REQ_PICK = 11
+                  private val BG = Color.parseColor("#0F1514")
+                  private val SURFACE = Color.parseColor("#172120")
+                  private val FG = Color.parseColor("#E6EEEA")
+                  private val MUTED = Color.parseColor("#8FA19A")
+                  private val LINE = Color.parseColor("#2A3836")
+                  private val ACCENT = Color.parseColor("#4FC4B3")
+                  private val ACCENT_INK = Color.parseColor("#072420")
+              }
+          }
+          LP_EOF
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Name the APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk LecturePlayer.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LecturePlayer-apk
+          path: LecturePlayer.apk
+
+      - name: Publish as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          gh release create "apk-$RUN_NUM" LecturePlayer.apk --title "LecturePlayer build $RUN_NUM" --notes "Debug APK. Download LecturePlayer.apk and install it."
